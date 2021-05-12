@@ -1,0 +1,76 @@
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job_logging: null
+  hydra_logging: null
+
+name: cfgrnn2seq
+project_name: CFG2Seq-rnn
+
+seed: 42
+num_workers: 8
+log_offline: false
+
+resume_from_checkpoint: null
+
+# data keys
+data_folder: data-permanent
+vocabulary_name: vocabulary.json
+train_holdout: train
+val_holdout: val
+test_holdout: test-noone
+
+save_every_epoch: 1
+val_every_epoch: 1
+log_every_epoch: 3
+progress_bar_refresh_rate: 1
+
+vocabulary_min_num: 50
+
+hyper_parameters:
+  n_epochs: 36
+  patience: 3
+  batch_size: 64
+  test_batch_size: 128
+  clip_norm: 5
+  max_paths: 16
+  max_lines: 128
+  random_context: true
+  shuffle_data: true
+
+  optimizer: "Momentum"
+  nesterov: true
+  learning_rate: 0.1
+  weight_decay: 0
+  decay_gamma: 0.95
+
+dataset:
+  name: java-small
+  target:
+    max_length: 10
+    use_SOS: true
+    use_EOS: true
+    is_splitted: true
+  unit:
+    max_length: 64
+    use_SOS: false
+    use_EOS: true
+    is_splitted: true
+  path:
+    path_PAD: -2
+    path_EOS: -1
+    max_length: 128
+
+encoder:
+  max_path_length: 32
+  embedding_size: 1024
+  rnn_size: 1024
+  use_bi_rnn: true
+  rnn_num_layers: 1
+  rnn_dropout: 0.4
+
+decoder:
+  teacher_forcing: 1
+  rnn_num_layers: 1
+  rnn_dropout: 0.4

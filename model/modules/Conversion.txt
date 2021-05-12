@@ -1,0 +1,162 @@
+from typing import List
+from omegaconf import dictconfig
+import numpy
+
+import torch
+from torch import nn
+from torch.nn.modules.sparse import Embedding
+from torch.nn.modules.transformer import TransformerEncoder, TransformerEncoderLayer
+
+from utils.vocabulary import Vocabulary, SOS, PAD, UNK, EOS, CLS, SEP
+from model.modules.positional_encoder import PositionalEncoding
+
+class Conversion(nn.Module):
+    def __init__(
+        self,
+        config: dictconfig,
+        vocabulary: Vocabulary,
+        n_tokens: int,
+        token_pad_id: int,
+    ):
+        super().__init__()
+        self._vocabulary = vocabulary
+        self.pad_id = token_pad_id
+
+        self.num_directions = 2 if config.use_bi_rnn else 1
+        self.token_embedding = nn.Embedding(len(self._vocabulary.label_to_id), config.embedding_size, padding_idx=self._vocabulary.label_to_id[PAD])
+
+        self.dropout_lstm = nn.Dropout(config.rnn_dropout)
+        self.unit_lstm = nn.LSTM(
+            input_size=config.embedding_size,
+            hidden_size=config.rnn_size,
+            num_layers=config.rnn_num_layers,
+            bidirectional=config.use_bi_rnn,
+            dropout=config.rnn_dropout if config.rnn_num_layers > 1 else 0,
+        )
+        self.lstm_concat_layer = nn.Linear(self.num_directions*config.rnn_size, config.embedding_size, bias=False)
+
+        self.expath_encoder_layers = config.expath_encoder_layers
+        self.order_encoder_layers = config.order_encoder_layers
+        self.decoder_layers = config.decoder_layers
+        self.attn_heads = config.attn_heads
+        self.ffn_dim = config.ffn_dim
+        self.dropout = config.dropout
+        self.hidden = config.embedding_size
+
+        self.positionalencoding = PositionalEncoding(d_model=self.hidden)
+        self.transformer_encoder_layer = TransformerEncoderLayer(d_model=self.hidden, nhead=self.attn_heads,
+                                                                     dim_feedforward=self.ffn_dim, dropout=self.dropout)
+        self.expath_transformer_encoder = TransformerEncoder(encoder_layer=self.transformer_encoder_layer,
+                                                          num_layers=self.expath_encoder_layers)
+        self.order_transformer_encoder = TransformerEncoder(encoder_layer=self.transformer_encoder_layer,
+                                                          num_layers=self.order_encoder_layers)
+        self.transformer_decoder_layer = TransformerEncoderLayer(d_model=self.hidden, nhead=self.attn_heads,
+                                                                     dim_feedforward=self.ffn_dim, dropout=self.dropout)
+        self.transformer_decoder = TransformerEncoder(encoder_layer=self.transformer_encoder_layer,
+                                                          num_layers=self.decoder_layers)
+
+
+    def _concat_batch(self, features:torch.Tensor, features_mask: torch.Tensor, num_per_batch: List[int], dim: int = 3, mask_value: bool = True):
+        # features: [length; total_num; embedding_size]/[total_num; embedding_size]
+        # features_mask: [length; batch_num]/[batch_num]
+        # num_per_batch: [batch_num]
+        # dim: features dim (2/3)
+        batch_size = len(num_per_batch)
+        max_context_num = max(num_per_batch)
+        if dim == 2:
+            features = features.unsqueeze(dim = 0)
+            features_mask = features_mask.unsqueeze(dim = 0)
+        batched_features = features.new_zeros((features.shape[0]*max_context_num, batch_size, features.shape[-1]))
+        attention_mask = (features==0).new_ones((features.shape[0]*max_context_num, batch_size))
+        cum_sums = numpy.cumsum(num_per_batch)
+        start_of_segments = numpy.append([0], cum_sums[:-1])
+        slices = [slice(start, end) for start, end in zip(start_of_segments, cum_sums)]
+        for i, (cur_slice, cur_size) in enumerate(zip(slices, num_per_batch)):
+            batched_features[:cur_size*features.shape[0], i] = features[:, cur_slice].reshape([-1, features.shape[-1]])
+            attention_mask[:cur_size*features.shape[0], i] = features_mask[:, cur_slice].reshape([-1,1]).squeeze()
+
+        # batched_features: [length*max_context_num; batch_num; embedding_size]/[max_context_num, batch_num, embedding_size]
+        # attention_mask: [length*max_context_num; batch_num]/[max_context_num; batch_num]
+        return batched_features, attention_mask
+
+    def _unit_embedding(self, units: torch.Tensor) -> torch.Tensor:
+        # units: [unit_length; total units; embedding size]
+        encoded_tokens = self.token_embedding(units)
+        with torch.no_grad():
+            is_contain_pad_id, first_pad_pos = torch.max(units == self.pad_id, dim=0)
+            first_pad_pos[~is_contain_pad_id] = units.shape[0]  # if no pad token use len+1 position
+            sorted_path_lengths, sort_indices = torch.sort(first_pad_pos, descending=True)
+            _, reverse_sort_indices = torch.sort(sort_indices)
+            sorted_path_lengths = sorted_path_lengths.to(torch.device("cpu"))
+        unit_embeddings = encoded_tokens[:,sort_indices]
+
+        packed_path_units = nn.utils.rnn.pack_padded_sequence(unit_embeddings, sorted_path_lengths)
+
+        # [num layers * num directions; total units; rnn size]
+        _, (h_t, _) = self.unit_lstm(packed_path_units)
+        # [total units; rnn size * num directions]
+        encoded_units = h_t[-self.num_directions :].transpose(0, 1).reshape(h_t.shape[1], -1)
+        encoded_units = self.dropout_lstm(encoded_units)
+
+        encoded_units = encoded_units[reverse_sort_indices]
+        # [total units; embedding size]
+        return encoded_units
+    
+    def _order_to_path(
+        self,
+        unit_features: torch.Tensor,
+        units_per_data: torch.Tensor,
+        paths: torch.Tensor, 
+        path_per_data: List[int],
+        SEP_feature: torch.Tensor
+    ):
+        batch_size = len(units_per_data)
+        zero_feature = unit_features.new_zeros([1,unit_features.shape[-1]])
+        SEP_feature = SEP_feature.unsqueeze(dim=0)
+        paths_per_batch = []
+        expaths_context = []
+        expaths_mask = []
+        # unit_path = paths.new_zeros()
+        paths_begin = 0
+        units_begin = 0
+        for i in range(batch_size):
+            paths_num = path_per_data[i]
+            batch_paths = paths[:,paths_begin:paths_begin+paths_num]
+            paths_begin += paths_num
+
+            units_num = units_per_data[i]
+            batch_units = unit_features[units_begin:units_begin+units_num]
+            units_begin += units_num
+            backward_unit = torch.cat([zero_feature, SEP_feature, batch_units])
+            for j in range(paths_num):  
+                backward_path = batch_paths[:,j]+2
+                zero = torch.zeros_like(backward_path)
+                backward_path = torch.where(backward_path >= backward_unit.shape[0], zero, backward_path)
+                expath_mask = (backward_path==0)
+                # print("\n",backward_unit.shape[0]," ", min(backward_path)," ", max(backward_path))
+                path_context = torch.index_select(backward_unit, 0, backward_path)
+                expaths_mask.append(expath_mask)
+                expaths_context.append(path_context)
+        # [path length, total num, embed]
+        expaths_context = torch.stack(expaths_context).transpose(0, 1)
+        expaths_mask = torch.stack(expaths_mask).transpose(0, 1)
+
+        return expaths_context, expaths_mask
+
+    def _path_to_order(
+        self,
+        path_features: torch.Tensor, # [path_length; total_num; embedding_size]
+        paths: torch.Tensor, # [path_length; total_num]
+        path_per_data: List[int],
+    ):
+        batch_size = len(path_per_data)
+        order_length = torch.max(paths).values
+        order_feature = path_features.new_zeros([order_length, batch_size, path_features.shape[-1]])
+        all_feature = path_features.new_zeros([order_length, path_features.shape[-2], path_features.shape[-1]])
+        for index in range(paths.shape[-1]):
+            path = paths[:,index]
+            
+        for batch in batch_size:
+
+
+        return expaths_context, expaths_mask

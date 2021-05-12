@@ -1,0 +1,80 @@
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job_logging: null
+  hydra_logging: null
+
+name: seq2seq
+project_name: CFG2Seq-trans
+
+seed: 42
+num_workers: 8
+log_offline: false
+
+resume_from_checkpoint: null
+
+# data keys
+data_folder: data-permanent
+vocabulary_name: vocabulary.json
+train_holdout: train
+val_holdout: val
+test_holdout: test-noone
+
+save_every_epoch: 1
+val_every_epoch: 1
+log_every_epoch: 3
+progress_bar_refresh_rate: 1
+
+vocabulary_min_num: 50
+
+hyper_parameters:
+  n_epochs: 24
+  patience: 3
+  batch_size: 12
+  test_batch_size: 32
+  clip_norm: 5
+  max_paths: 6
+  max_lines: 32
+  random_context: true
+  shuffle_data: true
+
+  optimizer: "Momentum"
+  nesterov: true
+  learning_rate: 0.001
+  weight_decay: 0
+  decay_gamma: 0.95
+
+dataset:
+  name: java-small
+  target:
+    max_length: 6
+    use_SOS: true
+    use_EOS: true
+    is_splitted: true
+  unit:
+    max_length: 28
+    use_SOS: false
+    use_EOS: true
+    is_splitted: true
+  path:
+    path_PAD: -2
+    path_EOS: -1
+    max_length: 32
+encoder:
+  embedding_size: 256
+  embedding_dropout: 0.25
+  path_layers: 2
+  final_layers: 0
+  attn_heads: 4
+  ffn_dim: 1024
+  dropout: 0.1
+
+decoder:
+  teacher_forcing: 1
+  beam_width: 0
+  order_encoder_layers: 1
+  n_layers: 2
+  attn_heads: 4
+  ffn_dim: 1024
+  dropout: 0.1
